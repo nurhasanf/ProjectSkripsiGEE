@@ -1,0 +1,336 @@
+var roi = ee.FeatureCollection('users/idoandifyfirdaus/RoI/DasCisanggarung'); 
+var geometry = roi.geometry();
+var modules = require('users/idoandifyfirdaus/Final-OBIA-Project:modules/modules');
+
+var collection = modules.cloudfreeSentinel2();
+
+var start_date = ee.Date.fromYMD(2023, 5, 1);
+var end_date = ee.Date.fromYMD(2024, 5, 23);
+
+var filtered = collection.filterBounds(geometry)
+                         .filterDate(start_date, end_date)
+                         .filter(ee.Filter.isContained({
+                             leftValue: geometry,
+                             rightField: '.geo'
+                         }));
+
+filtered = filtered.select('B[2-7]|B8.*|B1.');
+filtered = filtered.map(modules.scaleFactors)
+                   .map(modules.addIndices);
+
+var reducers = ee.Reducer.mean()
+                            .combine({reducer2:ee.Reducer.min(), sharedInputs:true})
+                            .combine({reducer2:ee.Reducer.max(), sharedInputs:true})
+                            .combine({reducer2:ee.Reducer.stdDev(), sharedInputs:true})
+                            .combine({reducer2:ee.Reducer.percentile([5,25,50,75,95]), sharedInputs:true});
+
+var composite = filtered.reduce(reducers);
+
+/*---------------------------------------------------------------------------------*/
+// Export.image.toAsset({
+//   image:composite.clip(geometry),
+//   description:'Composite',
+//   region:geometry,
+//   scale:10,
+//   maxPixels:1e13,
+//   assetId:'users/idoandifyfirdaus/Final-Thesis/Composite'
+// });
+
+composite = ee.Image('users/idoandifyfirdaus/Final-Thesis/Composite');
+Map.addLayer(composite.clip(roi), {min:0, max:0.3, bands:['B4_p50','B3_p50','B2_p50']}, 'RGB', false);
+/*---------------------------------------------------------------------------------*/
+var size_segmentation = 10;
+
+var seeds = ee.Algorithms.Image.Segmentation.seedGrid(size_segmentation);
+
+var snic_composite = ee.Algorithms.Image.Segmentation.SNIC({
+  image: composite, 
+  compactness: 0.1,  
+  connectivity: 8, 
+  neighborhoodSize: 256, 
+  seeds: seeds
+});
+
+/*---------------------------------------------------------------------------------*/
+// Export.image.toAsset({
+//   image:snic_composite.clip(geometry),
+//   description:'snic_composite',
+//   region:geometry,
+//   scale:10,
+//   maxPixels:1e13,
+//   assetId:'users/idoandifyfirdaus/Final-Thesis/Segmented-Composite-10'
+// });
+
+snic_composite = ee.Image('users/idoandifyfirdaus/Final-Thesis/Segmented-Composite-10');
+// snic_composite = ee.Image('users/idoandifyfirdaus/Final-OBIA-Project/Single-Segmented-Composite-10').clip(geometry);
+snic_composite = snic_composite.regexpRename('_mean$', '');
+
+Map.addLayer(snic_composite,{min:0,max:0.3,bands:['B4_mean','B3_mean','B2_mean']}, 'Segmented Composite', false);
+/*---------------------------------------------------------------------------------*/
+var clusters = snic_composite.select('clusters');
+var vectors = clusters.reduceToVectors({
+  geometryType: 'polygon',
+  reducer: ee.Reducer.countEvery(),
+  scale: 10,
+  maxPixels: 1e13,
+  // geometry: geometry
+});
+
+// Count the number of vectors (polygons)
+var objectCount = vectors.size();
+
+// Print the number of objects
+print('Number of objects:', objectCount);
+
+var outline = ee.Image().byte().paint({
+  featureCollection: vectors,
+  color: 1,
+  width: 1
+});
+Map.addLayer(outline, {palette: 'FF0000'}, 'Object-Segment', false);
+
+/*---------------------------------------------------------------------------------*/
+
+snic_composite = snic_composite.select('B.*|M.*|N.*');
+
+var training_samples = ee.FeatureCollection([lahan_terbangun,lahan_terbuka,
+                                    sawah,ladang,semak_belukar,
+                                    hutan_lahan_basah,hutan_lahan_kering,
+                                    kebun_campuran,perkebunan,perairan
+                                    ]).flatten();
+
+training_samples = snic_composite.sampleRegions({
+                              collection:training_samples,
+                              properties:['landcover'],
+                              scale:10,
+                              geometries:true,
+                            });
+/*---------------------------------------------------------------------------------*/
+// Export the result as CSV
+// Export.table.toDrive({
+//   collection: training_samples,
+//   description: 'training_samples',
+//   folder: 'earthengine',
+//   fileNamePrefix: 'training_samples',
+//   fileFormat: 'CSV'});
+/*---------------------------------------------------------------------------------*/
+
+var predictor_bands = snic_composite.bandNames();
+
+// Random Forest Classifier
+var RF_classifier = ee.Classifier.smileRandomForest({numberOfTrees:500}).train({
+                              features:training_samples,
+                              classProperty:'landcover',
+                              inputProperties:predictor_bands
+                            });
+
+// --------------------------- VARIABLE IMPORTANCE -------------------------------
+var IVnum = 20;
+var classifierDetails = RF_classifier.explain();
+var importance = ee.Dictionary(RF_classifier.explain().get('importance'));
+
+// Calculate relative importance
+var sum = importance.values().reduce(ee.Reducer.sum());
+
+var relativeImportance = importance.map(function(key, val) {
+  return ee.Number(val).divide(sum);
+  });
+  
+// find most important
+var features = ee.FeatureCollection(relativeImportance.map(function(k,v){
+  return ee.Feature(null, {'band': k, 'importancy': v});
+  
+}).values());
+var mostImportant = features.sort('importancy', false).limit(IVnum);
+
+// Chart of Variable Importance
+var chart = ui.Chart.feature.byFeature({
+  features:mostImportant,
+  xProperty:'band',
+  yProperties:'importancy'
+}).setChartType('ColumnChart')
+.setOptions({
+  title: 'Variable Importance',
+  legend: {position: 'none'},
+  hAxis: {title: 'Bands'},
+  vAxis: {title: 'Importance'}
+});
+
+print(chart);
+
+// Classification
+var classified_image = snic_composite.classify(RF_classifier);
+
+// Classified Image Visualization
+var palette= ['#ff0505','#af6c6c','#a1ff99','#c6d875','#e1ff1f',
+              '#ff9a4c','#079530','#08d893','#076200','#008aff'];
+
+Map.addLayer(classified_image, {min:1,max:10, palette:palette}, 'Classification', false);
+Map.centerObject(geometry, 10);
+/*---------------------------------------------------------------------------------*/
+var validation_samples = ee.FeatureCollection('users/idoandifyfirdaus/Final-Thesis/Groundcheck');
+
+var test = snic_composite.sampleRegions({
+  collection: validation_samples,
+  properties: ['GrndTruth'],
+  scale: 10,
+});
+
+// Tune the numberOfTrees parameter.
+var numTreesList = ee.List.sequence(10, 1000, 10);
+
+var accuracies = numTreesList.map(function(numTrees) {
+  var classifier = ee.Classifier.smileRandomForest(numTrees)
+      .train({
+        features: training_samples,
+        classProperty: 'landcover',
+        inputProperties: predictor_bands
+      });
+
+  // Here we are classifying a table instead of an image
+  // Classifiers work on both images and tables
+  return test
+    .classify(classifier)
+    .errorMatrix('GrndTruth', 'classification')
+    .accuracy();
+});
+
+var chart = ui.Chart.array.values({
+  array: ee.Array(accuracies),
+  axis: 0,
+  xLabels: numTreesList
+  }).setOptions({
+      title: 'Hyperparameter Tuning for the numberOfTrees',
+      vAxis: {title: 'Validation Accuracy'},
+      hAxis: {title: 'Number of Tress', gridlines: {count: 15}}
+  });
+print(chart);
+/*---------------------------------------------------------------------------------*/
+// Accuracy Assessment
+validation_samples = classified_image.sampleRegions({
+                              collection:validation_samples,
+                              properties:['GrndTruth'],
+                              scale:10,
+                              geometries:true,
+                            });
+
+print(validation_samples);
+
+// Confusion Matrix
+var confusion_matrix = validation_samples.errorMatrix('GrndTruth', 'classification');
+print('Confusion Matrix', confusion_matrix);
+
+// Overall Accuracy
+var overall_accuracy = confusion_matrix.accuracy();
+print('Overall Accuracy', overall_accuracy);
+
+// Producer's Accuracy
+var producer_accuracy = confusion_matrix.producersAccuracy();
+print('Producer Accuracy', producer_accuracy);
+
+// Consumer's Accuracy
+var consumer_accuracy = confusion_matrix.consumersAccuracy();
+print('Consumer Accuracy', consumer_accuracy);
+
+// Kappa Coeficient
+var kappa_coeficient = confusion_matrix.kappa();
+print('Kappa Coefficient', kappa_coeficient);
+
+/*---------------------------------------------------------------------------------*/
+// First create a 2 band image with the area image and the classified image
+// Divide the area image by 1e4 so area results are in hectare
+var areaImage = ee.Image.pixelArea().divide(1e4).addBands(classified_image);
+
+// Calculate areas
+var areas = areaImage.reduceRegion({
+      reducer: ee.Reducer.sum().group({
+      groupField: 1,
+      groupName: 'classification',
+    }),
+    geometry: geometry,
+    scale: 10,
+    maxPixels: 1e13
+    }); 
+
+var class_areas = ee.List(areas.get('groups'));
+
+// Process results to extract the areas and
+// create a FeatureCollection
+
+// We can define a dictionary with class names
+var class_names = ee.Dictionary({
+  '1': 'Lahan Terbangun',
+  '2': 'Lahan Terbuka',
+  '3': 'Sawah',
+  '4': 'Ladang',
+  '5': 'Semak Belukar',
+  '6': 'Hutan Lahan Basah',
+  '7': 'Hutan Lahan Kering',
+  '8': 'Kebun Campuran',
+  '9': 'Perkebunan',
+  '10': 'Perairan'
+});
+
+class_areas = class_areas.map(function(item) {
+  var area_dict = ee.Dictionary(item);
+  var class_number = ee.Number(area_dict.get('classification')).format();
+  var class_name = class_names.get(class_number);
+  var area = ee.Number(
+    area_dict.get('sum'));
+  return ee.Feature(null, {'class': class_number, 'class_name': class_name, 'area': area});
+});
+
+var class_area_fc = ee.FeatureCollection(class_areas);
+
+// We can now chart the resulting FeatureCollection
+// If your area is large, it is advisable to first Export
+// the FeatureCollection as an Asset and import it once
+// the export is finished.
+// Let's create a Bar Chart
+
+var bar_chart = ui.Chart.feature.byProperty({
+  features: class_area_fc,
+  xProperties: ['area'],
+  seriesProperty: 'class_name',
+}).setChartType('ColumnChart')
+  .setOptions({
+    hAxis: {title: 'Landcover Classes'},
+    vAxis: {title: 'Area (Hectare)'},
+    title: 'Area by class',
+    series: {
+      0: {color: '#ff0505'},
+      1: {color: '#af6c6c'},
+      2: {color: '#a1ff99'},
+      3: {color: '#c6d875'},
+      4: {color: '#e1ff1f'},
+      5: {color: '#ff9a4c'},
+      6: {color: '#079530'},
+      7: {color: '#08d893'},
+      8: {color: '#076200'},
+      9: {color: '#008aff'},
+      
+    }
+  });
+
+print(bar_chart); 
+
+
+// We can also create a Pie-Chart
+var palette= ['#ff0505','#af6c6c','#a1ff99','#c6d875','#e1ff1f',
+              '#ff9a4c','#079530','#08d893','#076200','#008aff'
+             ];
+
+var pie_chart = ui.Chart.feature.byFeature({
+  features: class_area_fc,
+  xProperty: 'class_name',
+  yProperties: ['area']
+}).setChartType('PieChart')
+  .setOptions({
+    hAxis: {title: 'Classes'},
+    vAxis: {title: 'Area (Hectare)'},
+    title: 'Area by class',
+    colors: palette
+  });
+
+print(pie_chart);
+/*---------------------------------------------------------------------------------*/
